@@ -1,12 +1,4 @@
 {
-  "extraKnownMarketplaces": {
-    "caveman": {
-      "source": {
-        "source": "github",
-        "repo": "JuliusBrussee/caveman"
-      }
-    }
-  },
   "autoApprovalSettings": {
     "enableAutoApproval": true,
     "rules": [
@@ -46,8 +38,5 @@
         "autoApprove": true
       }
     ]
-  },
-  "enabledPlugins": {
-    "caveman@caveman": true
   }
 }
