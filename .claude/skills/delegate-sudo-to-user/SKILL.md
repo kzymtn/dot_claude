@@ -1,6 +1,6 @@
 ---
-name: deligate-sudo-to-user
-description: When agents need sudo operation, agents deligate sudo operation to user.
+name: delegate-sudo-to-user
+description: When agents need sudo operation, agents delegate sudo operation to user.
 ---
 
 sudo コマンドが必要になる場合，それを直接実行しようとせず
