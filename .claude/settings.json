@@ -1,0 +1,53 @@
+{
+  "extraKnownMarketplaces": {
+    "caveman": {
+      "source": {
+        "source": "github",
+        "repo": "JuliusBrussee/caveman"
+      }
+    }
+  },
+  "autoApprovalSettings": {
+    "enableAutoApproval": true,
+    "rules": [
+      {
+        "tool": "Bash",
+        "pattern": "pkill.*",
+        "autoApprove": true
+      },
+      {
+        "tool": "Bash",
+        "pattern": "npm start.*",
+        "autoApprove": true
+      },
+      {
+        "tool": "Bash",
+        "pattern": "python3.*",
+        "autoApprove": true
+      },
+      {
+        "tool": "Bash",
+        "pattern": "pip3 install.*",
+        "autoApprove": true
+      },
+      {
+        "tool": "Bash",
+        "pattern": "node utils/.*",
+        "autoApprove": true
+      },
+      {
+        "tool": "Bash",
+        "pattern": "nohup.*",
+        "autoApprove": true
+      },
+      {
+        "tool": "Bash",
+        "pattern": "cd .* && npm.*",
+        "autoApprove": true
+      }
+    ]
+  },
+  "enabledPlugins": {
+    "caveman@caveman": true
+  }
+}
