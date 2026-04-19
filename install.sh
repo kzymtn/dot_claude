@@ -5,21 +5,24 @@ REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CLAUDE_DIR="${HOME}/.claude"
 
 usage() {
-  echo "Usage: $0 [--copy | --link] [--dry-run]"
+  echo "Usage: $0 [--copy | --link] [--force] [--dry-run]"
   echo ""
   echo "  --copy     Copy files (default)"
   echo "  --link     Symlink directories instead of copying"
+  echo "  --force    With --link: replace existing real dirs with symlinks"
   echo "  --dry-run  Show what would happen without making changes"
   exit 1
 }
 
 MODE="copy"
 DRY_RUN=false
+FORCE=false
 
 for arg in "$@"; do
   case "$arg" in
     --copy)    MODE="copy" ;;
     --link)    MODE="link" ;;
+    --force)   FORCE=true ;;
     --dry-run) DRY_RUN=true ;;
     -h|--help) usage ;;
     *) echo "Unknown option: $arg"; usage ;;
@@ -56,14 +59,23 @@ install_dir() {
 
   if [[ "$MODE" == "link" ]]; then
     if [[ -d "$dst" && ! -L "$dst" ]]; then
-      echo "WARNING: ${dst} exists and is not a symlink. Skipping to avoid data loss."
-      echo "         Remove or rename it manually, then re-run."
+      if $FORCE; then
+        local backup="${dst}.bak.$(date +%Y%m%d%H%M%S)"
+        run mv "$dst" "$backup"
+        echo "Backed up: ${dst} -> ${backup}"
+        run ln -sfn "$src" "$dst"
+        echo "Linked:  ${dst} -> ${src} (replaced real dir)"
+      else
+        echo "WARNING: ${dst} exists and is not a symlink. Skipping to avoid data loss."
+        echo "         Re-run with --force to replace it, or remove manually."
+      fi
     else
       run ln -sfn "$src" "$dst"
       echo "Linked:  ${dst} -> ${src}"
     fi
   else
-    run cp -r "$src" "$dst"
+    run mkdir -p "$dst"
+    run cp -r "$src/." "$dst"
     echo "Copied:  ${dst}"
   fi
 }
@@ -73,14 +85,18 @@ $DRY_RUN && echo "(dry-run mode — no changes will be made)"
 echo ""
 
 run mkdir -p "${CLAUDE_DIR}"
-run mkdir -p "${CLAUDE_DIR}/hooks"
-run mkdir -p "${CLAUDE_DIR}/plugins"
+# hooks and plugins created only in copy mode; link mode manages them via install_dir
+if [[ "$MODE" == "copy" ]]; then
+  run mkdir -p "${CLAUDE_DIR}/hooks"
+  run mkdir -p "${CLAUDE_DIR}/plugins"
+fi
 
 # ── Directories ────────────────────────────────────────────────
 install_dir skills
 install_dir hooks
 
 # ── Single files ───────────────────────────────────────────────
+run mkdir -p "${CLAUDE_DIR}/plugins"
 copy_file "${REPO_DIR}/.claude/settings.json"             "${CLAUDE_DIR}/settings.json"
 copy_file "${REPO_DIR}/.claude/keybindings.json"          "${CLAUDE_DIR}/keybindings.json"
 copy_file "${REPO_DIR}/.claude/plugins/known_marketplaces.json" \
