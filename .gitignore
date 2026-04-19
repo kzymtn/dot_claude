@@ -21,3 +21,13 @@
 .claude/telemetry/
 .claude/todos/
 .claude/settings.local.json
+
+# Credentials and secrets
+.claude/.credentials.json
+.claude/plugins/installed_plugins.json
+.claude/plugins/blocklist.json
+.claude/plugins/config.json
+
+# Local hook secrets (e.g. .env files inside hooks/)
+.claude/hooks/*.env
+.claude/hooks/*.local.sh

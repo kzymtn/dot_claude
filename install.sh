@@ -34,36 +34,61 @@ run() {
   fi
 }
 
-echo "Installing dot_claude to ${CLAUDE_DIR} (mode: ${MODE})"
-$DRY_RUN && echo "(dry-run mode — no changes will be made)"
-
-mkdir -p "${CLAUDE_DIR}"
-
-# skills
-if [[ "$MODE" == "link" ]]; then
-  if [[ -d "${CLAUDE_DIR}/skills" && ! -L "${CLAUDE_DIR}/skills" ]]; then
-    echo "WARNING: ${CLAUDE_DIR}/skills exists and is not a symlink. Skipping to avoid data loss."
-    echo "         Remove or rename it manually, then re-run."
+# Copy a single file; skip with warning if destination already exists
+copy_file() {
+  local src="$1" dst="$2"
+  if [[ -f "$dst" ]]; then
+    echo "WARNING: ${dst} already exists. Skipping."
+    echo "         Merge manually from: ${src}"
   else
-    run ln -sfn "${REPO_DIR}/.claude/skills" "${CLAUDE_DIR}/skills"
-    echo "Linked: ${CLAUDE_DIR}/skills -> ${REPO_DIR}/.claude/skills"
+    run cp "$src" "$dst"
+    echo "Copied:  ${dst}"
   fi
-else
-  run cp -r "${REPO_DIR}/.claude/skills" "${CLAUDE_DIR}/"
-  echo "Copied: ${CLAUDE_DIR}/skills"
-fi
+}
 
-# settings.json — merge if exists, copy if not
-SETTINGS_SRC="${REPO_DIR}/.claude/settings.json"
-SETTINGS_DST="${CLAUDE_DIR}/settings.json"
+# Install a directory — symlink or copy
+install_dir() {
+  local name="$1"
+  local src="${REPO_DIR}/.claude/${name}"
+  local dst="${CLAUDE_DIR}/${name}"
 
-if [[ -f "${SETTINGS_DST}" ]]; then
-  echo "WARNING: ${SETTINGS_DST} already exists. Skipping to avoid overwrite."
-  echo "         Merge manually from: ${SETTINGS_SRC}"
-else
-  run cp "${SETTINGS_SRC}" "${SETTINGS_DST}"
-  echo "Copied: ${SETTINGS_DST}"
-fi
+  [[ -d "$src" ]] || return 0
+
+  if [[ "$MODE" == "link" ]]; then
+    if [[ -d "$dst" && ! -L "$dst" ]]; then
+      echo "WARNING: ${dst} exists and is not a symlink. Skipping to avoid data loss."
+      echo "         Remove or rename it manually, then re-run."
+    else
+      run ln -sfn "$src" "$dst"
+      echo "Linked:  ${dst} -> ${src}"
+    fi
+  else
+    run cp -r "$src" "$dst"
+    echo "Copied:  ${dst}"
+  fi
+}
+
+echo "Installing dot_claude → ${CLAUDE_DIR} (mode: ${MODE})"
+$DRY_RUN && echo "(dry-run mode — no changes will be made)"
+echo ""
+
+run mkdir -p "${CLAUDE_DIR}"
+run mkdir -p "${CLAUDE_DIR}/hooks"
+run mkdir -p "${CLAUDE_DIR}/plugins"
+
+# ── Directories ────────────────────────────────────────────────
+install_dir skills
+install_dir hooks
+
+# ── Single files ───────────────────────────────────────────────
+copy_file "${REPO_DIR}/.claude/settings.json"             "${CLAUDE_DIR}/settings.json"
+copy_file "${REPO_DIR}/.claude/keybindings.json"          "${CLAUDE_DIR}/keybindings.json"
+copy_file "${REPO_DIR}/.claude/plugins/known_marketplaces.json" \
+                                                          "${CLAUDE_DIR}/plugins/known_marketplaces.json"
+
+# ── Home-level files ───────────────────────────────────────────
+copy_file "${REPO_DIR}/CLAUDE.md"  "${HOME}/CLAUDE.md"
+copy_file "${REPO_DIR}/.mcp.json"  "${HOME}/.mcp.json"
 
 echo ""
 echo "Done."
