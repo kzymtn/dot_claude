@@ -3,7 +3,7 @@ name: perplexity-research
 description: >
   複数 Web ソースを横断検索し、段階的ランキング・クロスソース検証を経て
   全事実主張に引用を付けた回答を生成する。Perplexity / Deep Research 型の
-  retrieval-rank-ground パイプラインを WebSearch + WebFetch で実装する。
+  retrieval-rank-ground パイプラインを Gemini CLI + WebSearch + WebFetch で実装する。
   「調べて」「最新の」「比較して」「どのソースが信頼できる」「research」
   「survey」「look up」「引用付きで」「ソースを示して」「Perplexity みたいに」
   「Deep Research」などのフレーズ、または学習データだけでは検証不能な
@@ -13,8 +13,9 @@ description: >
 
 # perplexity-research
 
-WebSearch と WebFetch を使い、Perplexity 型の 5 ステージパイプラインで回答する。
+/gemini-search (gemini コマンド) と WebSearch と WebFetch を使い、Perplexity 型の 5 ステージパイプラインで回答する。
 引用なしの事実主張は回答に含めない。
+claude のトークン数を節約するため大枠把握や論文を読むのには /gemini-search を優先的に用いる．
 
 ## パイプライン概要
 
