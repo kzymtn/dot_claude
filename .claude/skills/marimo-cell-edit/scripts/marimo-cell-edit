@@ -1,0 +1,486 @@
+#!/usr/bin/env python3
+"""
+marimo-cell-edit - Edit, add, and save cells in a running marimo notebook.
+
+Usage:
+  marimo-cell-edit [options] <cell_id> <code>
+  marimo-cell-edit [options] --batch <json_file>
+
+Arguments:
+  cell_id   Cell ID to update or create. For a new cell, use any unique string
+            (e.g. "my-cell-1"). For existing cells, get IDs from --list-cells.
+  code      New source code for the cell (use '-' to read from stdin)
+
+Options:
+  --port PORT       marimo server port (default: auto-detect from registry)
+  --host HOST       marimo server host (default: auto-detect from registry)
+  --file FILE       Match session by notebook file path (when multiple sessions)
+  --token TOKEN     Auth token (or set MARIMO_TOKEN env var)
+  --batch FILE      JSON file with list of {"cell_id": ..., "code": ...} objects
+  --save            Also persist all cells to disk after running
+                    (reads current cells from disk, merges edits, calls /api/kernel/save)
+  --dry-run         Print the request without sending it
+  --list-sessions   List active sessions and exit
+  --list-cells      List cells in the notebook file on disk and exit
+
+Notes:
+  - New cell IDs are registered in the running kernel immediately on run.
+  - Without --save the change is in-memory only (marimo auto-saves on user edits
+    in the browser, but not on API-driven changes).
+  - With --save the script reads existing cells from the .py file on disk,
+    applies your edits/additions, and calls POST /api/kernel/save.
+  - --save requires the session's notebook file to be on disk (not a new unsaved file).
+
+Examples:
+  # Add a new cell and persist to disk
+  marimo-cell-edit --save my-new-cell "x = 42"
+
+  # Edit an existing cell (get IDs from --list-cells)
+  marimo-cell-edit --list-cells
+  marimo-cell-edit --save Hoge "import pandas as pd"
+
+  # Edit multiple cells at once and save
+  marimo-cell-edit --save --batch cells.json
+
+  # Specify port and file when multiple notebooks are running
+  marimo-cell-edit --port 2718 --file analysis.py --save cell-abc123 "df = pd.read_csv('data.csv')"
+
+  # Read code from stdin (useful for multi-line code)
+  cat new_cell.py | marimo-cell-edit --save cell-abc123 -
+"""
+
+import argparse
+import ast
+import base64
+import json
+import os
+import re
+import sys
+import textwrap
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+
+# ---------------------------------------------------------------------------
+# Server discovery
+# ---------------------------------------------------------------------------
+
+def find_server_port() -> tuple[str, int]:
+    """Find running marimo server from the registry file."""
+    registry_dir = Path.home() / ".local" / "state" / "marimo" / "servers"
+    if not registry_dir.exists():
+        raise RuntimeError(
+            "No marimo server registry found at ~/.local/state/marimo/servers/\n"
+            "Start marimo with: marimo edit --no-token --no-skew-protection <notebook.py>"
+        )
+    servers = sorted(registry_dir.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+    if not servers:
+        raise RuntimeError("No running marimo server found in registry.")
+    data = json.loads(servers[0].read_text())
+    return data["host"], data["port"]
+
+
+# ---------------------------------------------------------------------------
+# HTTP helpers
+# ---------------------------------------------------------------------------
+
+def make_headers(token: str | None) -> dict[str, str]:
+    headers: dict[str, str] = {"Content-Type": "application/json"}
+    if token:
+        creds = base64.b64encode(f"user:{token}".encode()).decode()
+        headers["Authorization"] = f"Basic {creds}"
+    return headers
+
+
+def http_get(url: str, headers: dict) -> dict:
+    req = urllib.request.Request(url, headers=headers)
+    try:
+        with urllib.request.urlopen(req) as resp:
+            return json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        body = e.read().decode()
+        raise RuntimeError(f"HTTP {e.code} {e.reason}: {body}") from e
+
+
+def http_post(url: str, headers: dict, body: dict) -> str:
+    """POST and return raw response text (marimo /save returns Python source)."""
+    data = json.dumps(body).encode()
+    req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(req) as resp:
+            return resp.read().decode()
+    except urllib.error.HTTPError as e:
+        body_text = e.read().decode()
+        raise RuntimeError(f"HTTP {e.code} {e.reason}: {body_text}") from e
+
+
+def get_sessions(base_url: str, headers: dict) -> dict:
+    return http_get(f"{base_url}/api/sessions", headers)
+
+
+def resolve_session_id(sessions: dict, file_filter: str | None) -> tuple[str, str]:
+    """Returns (session_id, notebook_path)."""
+    if not sessions:
+        raise RuntimeError("No active sessions found. Is marimo running?")
+    if file_filter:
+        for sid, info in sessions.items():
+            path = info.get("filename", "") or info.get("path", "")
+            if file_filter in path:
+                return sid, path
+        raise RuntimeError(
+            f"No session found for file matching '{file_filter}'.\n"
+            f"Active sessions: {list(sessions.values())}"
+        )
+    if len(sessions) > 1:
+        session_list = "\n".join(
+            f"  {sid}: {info.get('filename', '?')}" for sid, info in sessions.items()
+        )
+        raise RuntimeError(
+            f"Multiple sessions active. Use --file to select one:\n{session_list}"
+        )
+    sid = next(iter(sessions))
+    path = sessions[sid].get("filename", "") or sessions[sid].get("path", "")
+    return sid, path
+
+
+def run_cells(
+    base_url: str, session_id: str, cell_ids: list[str], codes: list[str], headers: dict
+) -> dict:
+    body = {"cellIds": cell_ids, "codes": codes}
+    run_headers = {**headers, "Marimo-Session-Id": session_id}
+    resp = http_post(f"{base_url}/api/kernel/run", run_headers, body)
+    try:
+        return json.loads(resp)
+    except json.JSONDecodeError:
+        # /run always returns JSON; something unexpected happened
+        raise RuntimeError(f"Unexpected /api/kernel/run response: {resp}")
+
+
+# ---------------------------------------------------------------------------
+# Notebook cell parsing (reads .py file on disk)
+# ---------------------------------------------------------------------------
+
+def _default_cell_config() -> dict:
+    return {"column": None, "disabled": False, "hide_code": False}
+
+
+def _compute_marimo_internal_ids(n: int, prefix: str = "") -> list[str]:
+    """
+    Reproduce marimo's deterministic cell ID generation (seed=42).
+
+    marimo does NOT store cell IDs in .py files. At load time it generates
+    IDs using random.Random(seed=42), 4 ascii letters, no repeats.
+    This is the same algorithm as CellIdGenerator in marimo._ast.cell_id.
+
+    These IDs are what /api/kernel/run expects for EXISTING cells.
+    Using the function name as cell_id creates a new duplicate cell instead.
+    """
+    import random as _random
+    import string as _string
+    r = _random.Random(42)
+    seen: set[str] = set()
+    ids: list[str] = []
+    while len(ids) < n:
+        _id = prefix + "".join(r.choices(_string.ascii_letters, k=4))
+        if _id not in seen:
+            seen.add(_id)
+            ids.append(_id)
+    return ids
+
+
+def parse_notebook_cells(notebook_path: str) -> list[dict]:
+    """
+    Parse a marimo .py notebook file and return a list of cell dicts:
+      {
+        "cell_id":          str,  # marimo internal ID (computed, for /api/kernel/run)
+        "name":             str,  # function name (display label, for /api/kernel/save)
+        "code":             str,
+        "config":           dict,
+      }
+
+    IMPORTANT: marimo does not store cell IDs in .py files. IDs are generated
+    deterministically with seed=42 at load time. This function replicates that
+    algorithm so we can address existing cells correctly via /api/kernel/run.
+    """
+    src = Path(notebook_path).read_text()
+    cells: list[dict] = []
+
+    # Pattern: @app.cell decorator, then function def
+    pattern = re.compile(
+        r"@app\.cell(?:\([^)]*\))?\s*\n"   # @app.cell decorator
+        r"def\s+(\w+)\s*\(",               # group 1: function name
+        re.MULTILINE,
+    )
+
+    # Extract function bodies via AST
+    try:
+        tree = ast.parse(src)
+    except SyntaxError:
+        tree = None
+
+    func_bodies: dict[str, str] = {}
+    if tree:
+        src_lines = src.splitlines()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef):
+                body_start = node.body[0].lineno - 1  # 0-indexed
+                last_child = node.body[-1]
+                body_end = (
+                    last_child.end_lineno
+                    if hasattr(last_child, "end_lineno")
+                    else last_child.lineno
+                )
+                body_lines = src_lines[body_start:body_end]
+                # Strip trailing return/return (...) lines added by marimo
+                while body_lines and re.match(r"^\s*return\b", body_lines[-1]):
+                    body_lines.pop()
+                func_bodies[node.name] = textwrap.dedent("\n".join(body_lines))
+
+    # Collect cells in order of appearance
+    func_names = [m.group(1) for m in pattern.finditer(src)]
+
+    # Compute the internal IDs marimo assigned to each cell position
+    internal_ids = _compute_marimo_internal_ids(len(func_names))
+
+    for idx, func_name in enumerate(func_names):
+        cells.append({
+            "cell_id": internal_ids[idx],   # actual marimo internal ID
+            "name": func_name,              # display name / function name
+            "code": func_bodies.get(func_name, ""),
+            "config": _default_cell_config(),
+        })
+
+    return cells
+
+
+def build_save_request(
+    notebook_path: str,
+    edits: dict[str, str],  # cell_id -> new code
+    new_cells: dict[str, str],  # cell_id -> code (cells not yet on disk)
+) -> dict:
+    """
+    Build a SaveNotebookRequest body by reading current cells from disk,
+    applying edits, and appending new cells.
+    """
+    existing = parse_notebook_cells(notebook_path)
+
+    # Apply edits to existing cells
+    updated_ids = set()
+    for cell in existing:
+        if cell["cell_id"] in edits:
+            cell["code"] = edits[cell["cell_id"]]
+            updated_ids.add(cell["cell_id"])
+        elif cell["name"] in edits:
+            # Also allow editing by function name
+            cell["code"] = edits[cell["name"]]
+            updated_ids.add(cell["name"])
+
+    # Append truly new cells (not found on disk)
+    existing_cell_ids = {c["cell_id"] for c in existing}
+    existing_names = {c["name"] for c in existing}
+    for cid, code in new_cells.items():
+        if cid not in existing_cell_ids and cid not in existing_names:
+            existing.append({
+                "cell_id": cid,
+                "name": cid.replace("-", "_"),
+                "code": code,
+                "config": _default_cell_config(),
+            })
+
+    return {
+        "cellIds": [c["cell_id"] for c in existing],
+        "codes": [c["code"] for c in existing],
+        "names": [c["name"] for c in existing],
+        "configs": [c["config"] for c in existing],
+        "filename": str(Path(notebook_path).resolve()),
+        "persist": True,
+    }
+
+
+def save_notebook(
+    base_url: str, session_id: str, headers: dict, save_body: dict
+) -> None:
+    save_headers = {**headers, "Marimo-Session-Id": session_id}
+    # /api/kernel/save returns the serialized Python source on success
+    result = http_post(f"{base_url}/api/kernel/save", save_headers, save_body)
+    # Success if it starts with "import marimo" or is short JSON
+    if result.strip().startswith("import marimo") or '"success"' in result:
+        return  # ok
+    raise RuntimeError(f"Unexpected /api/kernel/save response: {result[:200]}")
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Edit, add, and save cells in a running marimo notebook.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__,
+    )
+    parser.add_argument("cell_id", nargs="?", help="Cell ID to update or create")
+    parser.add_argument("code", nargs="?", help="New source code (use '-' for stdin)")
+    parser.add_argument("--port", type=int, help="marimo server port (default: auto-detect)")
+    parser.add_argument("--host", default=None, help="marimo server host (default: auto-detect)")
+    parser.add_argument("--file", help="Match session by notebook filename")
+    parser.add_argument("--token", help="Auth token (or set MARIMO_TOKEN env var)")
+    parser.add_argument(
+        "--batch", metavar="FILE",
+        help='JSON file: [{"cell_id": ..., "code": ...}, ...]'
+    )
+    parser.add_argument(
+        "--save", action="store_true",
+        help="Also persist cells to disk via POST /api/kernel/save"
+    )
+    parser.add_argument("--dry-run", action="store_true", help="Print request without sending")
+    parser.add_argument("--list-sessions", action="store_true", help="List active sessions and exit")
+    parser.add_argument("--list-cells", action="store_true", help="List cells on disk and exit")
+
+    args = parser.parse_args()
+
+    token = args.token or os.environ.get("MARIMO_TOKEN")
+
+    # Resolve host/port
+    if args.port:
+        host = args.host or "127.0.0.1"
+        port = args.port
+    else:
+        host, port = find_server_port()
+    base_url = f"http://{host}:{port}"
+
+    headers = make_headers(token)
+
+    # --list-sessions
+    if args.list_sessions:
+        sessions = get_sessions(base_url, headers)
+        if not sessions:
+            print("No active sessions.")
+            return 0
+        print(f"Active sessions on {base_url}:")
+        for sid, info in sessions.items():
+            print(f"  {sid}  {info.get('filename', '?')}")
+        return 0
+
+    # --list-cells: resolve session to get notebook path, then parse from disk
+    if args.list_cells:
+        sessions = get_sessions(base_url, headers)
+        session_id, notebook_path = resolve_session_id(sessions, args.file)
+        if not notebook_path:
+            print("error: session has no associated file path", file=sys.stderr)
+            return 1
+        cells = parse_notebook_cells(notebook_path)
+        if not cells:
+            print(f"No cells found in {notebook_path}")
+            return 0
+        print(f"Cells in {notebook_path}  (session={session_id}):")
+        for c in cells:
+            preview = c["code"].replace("\n", " ")[:60]
+            print(f"  {c['cell_id']:30s}  {c['name']:20s}  {preview}")
+        return 0
+
+    # Collect cell_ids and codes
+    cell_ids: list[str] = []
+    codes: list[str] = []
+
+    if args.batch:
+        batch_path = Path(args.batch)
+        if not batch_path.exists():
+            print(f"error: batch file not found: {args.batch}", file=sys.stderr)
+            return 1
+        batch = json.loads(batch_path.read_text())
+        for item in batch:
+            cell_ids.append(item["cell_id"])
+            codes.append(item["code"])
+    elif args.cell_id and args.code:
+        if args.code == "-":
+            code = sys.stdin.read()
+        else:
+            # Interpret escape sequences like \n, \t so callers can pass
+            # multi-line code as a single shell argument without needing $'...'
+            code = args.code.replace("\\n", "\n").replace("\\t", "\t")
+        cell_ids.append(args.cell_id)
+        codes.append(code)
+    else:
+        parser.print_usage()
+        print("error: provide cell_id + code arguments, or use --batch", file=sys.stderr)
+        return 1
+
+    if args.dry_run:
+        print(f"POST {base_url}/api/kernel/run")
+        print("Marimo-Session-Id: <resolved from /api/sessions>")
+        print(json.dumps({"cellIds": cell_ids, "codes": codes}, indent=2))
+        if args.save:
+            print()
+            print("(--save) would also call POST /api/kernel/save with merged cell list")
+        return 0
+
+    # Resolve session
+    sessions = get_sessions(base_url, headers)
+    session_id, notebook_path = resolve_session_id(sessions, args.file)
+
+    # Resolve user-provided cell IDs to marimo internal IDs.
+    # marimo generates deterministic 4-letter IDs (seed=42) at load time and does
+    # NOT store them in the .py file.  Passing a function name to /api/kernel/run
+    # registers a brand-new cell and causes "redefines variables" conflicts.
+    existing_cells: list[dict] = []
+    if notebook_path:
+        existing_cells = parse_notebook_cells(notebook_path)
+        name_to_id = {c["name"]: c["cell_id"] for c in existing_cells}
+        run_cell_ids = [name_to_id.get(cid, cid) for cid in cell_ids]
+    else:
+        run_cell_ids = list(cell_ids)
+
+    # Execute cells in the running kernel
+    result_raw = run_cells(base_url, session_id, run_cell_ids, codes, headers)
+    if not result_raw.get("success"):
+        print(f"error: /api/kernel/run returned {result_raw}", file=sys.stderr)
+        return 1
+
+    # Optionally persist to disk
+    if args.save:
+        if not notebook_path:
+            print(
+                "error: --save requires the session to have a file path "
+                "(notebook has not been saved yet)",
+                file=sys.stderr,
+            )
+            return 1
+
+        # Determine which cells are new vs existing edits
+        # existing_cells was already loaded above for ID resolution; avoid re-parsing.
+        if not existing_cells:
+            existing_cells = parse_notebook_cells(notebook_path)
+        existing_ids = {c["cell_id"] for c in existing_cells}
+        existing_names = {c["name"] for c in existing_cells}
+
+        edits: dict[str, str] = {}
+        new_cells_map: dict[str, str] = {}
+        for cid, code in zip(cell_ids, codes):
+            if cid in existing_ids or cid in existing_names:
+                edits[cid] = code
+            else:
+                new_cells_map[cid] = code
+
+        save_body = build_save_request(notebook_path, edits, new_cells_map)
+        save_notebook(base_url, session_id, headers, save_body)
+        n_new = len(new_cells_map)
+        n_edit = len(edits)
+        parts = []
+        if n_edit:
+            parts.append(f"{n_edit} edited")
+        if n_new:
+            parts.append(f"{n_new} new")
+        print(
+            f"ok  session={session_id}  cells={cell_ids}  "
+            f"saved to {notebook_path}  ({', '.join(parts) or 'no changes'})"
+        )
+    else:
+        print(f"ok  session={session_id}  cells={cell_ids}  (in-memory only; use --save to persist)")
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -108,3 +108,7 @@ copy_file "${REPO_DIR}/.mcp.json"  "${HOME}/.mcp.json"
 
 echo ""
 echo "Done."
+echo ""
+echo "NOTE: 'make install' is now the recommended way to install dot_claude."
+echo "      It links ~/.claude, copies home files, and wires skill bin scripts."
+echo "      This script is kept for backward compatibility."

@@ -1,0 +1,115 @@
+#!/usr/bin/env bash
+# marimo-serve — zombie-free marimo server launcher
+#
+# Usage:
+#   marimo-serve [--port PORT] [--with PKG]... [--stop] <file.py>
+#
+# Examples:
+#   marimo-serve notebook.py
+#   marimo-serve --port 2725 notebook.py
+#   marimo-serve --with matplotlib --with pandas notebook.py
+#   marimo-serve --stop 2725          # stop server on port 2725
+#   marimo-serve --stop notebook.py   # stop server by notebook path
+#
+# Why nohup + PID file?
+#   `uvx marimo edit ... &` in Claude Code keeps the parent background shell
+#   alive as long as marimo runs → shells accumulate as "zombies".
+#   nohup detaches the process from the terminal, the launcher shell exits
+#   immediately, and marimo runs independently under init(1).
+#
+set -euo pipefail
+
+PID_DIR="${HOME}/.local/state/marimo/pids"
+LOG_DIR="${HOME}/.local/state/marimo/logs"
+mkdir -p "$PID_DIR" "$LOG_DIR"
+
+# ── stop mode ──────────────────────────────────────────────────────────────
+if [[ "${1:-}" == "--stop" ]]; then
+    target="${2:?usage: marimo-serve --stop <PORT|file.py>}"
+    if [[ "$target" =~ ^[0-9]+$ ]]; then
+        pid_file="$PID_DIR/$target.pid"
+    else
+        port=$(grep -rl "$(realpath "$target" 2>/dev/null || echo "$target")" "$PID_DIR"/*.pid.meta 2>/dev/null | head -1 | sed 's|.*/||;s|\.pid\.meta||')
+        pid_file="$PID_DIR/${port}.pid"
+    fi
+    if [[ -f "$pid_file" ]]; then
+        pid=$(cat "$pid_file")
+        port=$(basename "$pid_file" .pid)
+        kill "$pid" 2>/dev/null && echo "stopped  port=$port  pid=$pid" || echo "already dead  port=$port"
+        rm -f "$pid_file" "$PID_DIR/$port.pid.meta"
+    else
+        echo "no PID file found for: $target" >&2
+        exit 1
+    fi
+    exit 0
+fi
+
+# ── parse args ─────────────────────────────────────────────────────────────
+PORT=""
+WITH_PKGS=()
+NOTEBOOK=""
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --port)   PORT="$2";            shift 2 ;;
+        --with)   WITH_PKGS+=("$2");    shift 2 ;;
+        --*)      echo "unknown option: $1" >&2; exit 1 ;;
+        *)        NOTEBOOK="$1";        shift ;;
+    esac
+done
+
+if [[ -z "$NOTEBOOK" ]]; then
+    echo "usage: marimo-serve [--port PORT] [--with PKG]... <file.py>" >&2
+    exit 1
+fi
+
+# Create notebook file if it doesn't exist
+if [[ ! -f "$NOTEBOOK" ]]; then
+    touch "$NOTEBOOK"
+fi
+
+NOTEBOOK_ABS="$(realpath "$NOTEBOOK")"
+
+# ── choose port ─────────────────────────────────────────────────────────────
+if [[ -z "$PORT" ]]; then
+    # auto-select: find a free port starting from 2725
+    PORT=2725
+    while lsof -ti :"$PORT" >/dev/null 2>&1; do
+        PORT=$((PORT + 1))
+    done
+else
+    # kill any existing process on the requested port
+    existing=$(lsof -ti :"$PORT" 2>/dev/null || true)
+    if [[ -n "$existing" ]]; then
+        kill -9 $existing 2>/dev/null || true
+        sleep 0.5
+    fi
+fi
+
+# ── build uvx command ───────────────────────────────────────────────────────
+UVX_CMD="uvx"
+for pkg in "${WITH_PKGS[@]}"; do
+    UVX_CMD+=" --with $pkg"
+done
+UVX_CMD+=" marimo edit --no-token --no-skew-protection --watch --port $PORT $NOTEBOOK_ABS"
+
+# ── launch (nohup = detached, shell exits immediately) ───────────────────────
+LOG_FILE="$LOG_DIR/$PORT.log"
+nohup bash -c "$UVX_CMD" > "$LOG_FILE" 2>&1 &
+PID=$!
+
+echo "$PID" > "$PID_DIR/$PORT.pid"
+echo "$NOTEBOOK_ABS" > "$PID_DIR/$PORT.pid.meta"
+
+# brief wait to catch immediate startup errors
+sleep 2
+if ! kill -0 "$PID" 2>/dev/null; then
+    echo "ERROR: server failed to start. Check log: $LOG_FILE" >&2
+    tail -20 "$LOG_FILE" >&2
+    exit 1
+fi
+
+echo "started  port=$PORT  pid=$PID  notebook=$NOTEBOOK_ABS"
+echo "url      http://localhost:$PORT"
+echo "log      $LOG_FILE"
+echo "stop     marimo-serve --stop $PORT"

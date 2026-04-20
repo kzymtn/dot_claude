@@ -1,4 +1,4 @@
-@AGENT.md
+@AGENTS.md
 
 ## Plan フェーズでの Codex 参照
 
