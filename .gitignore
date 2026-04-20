@@ -20,6 +20,7 @@
 .claude/teams/
 .claude/telemetry/
 .claude/todos/
+.claude/settings.json
 .claude/settings.local.json
 
 # Credentials and secrets
