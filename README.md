@@ -11,7 +11,10 @@ dot_claude/
 ├── install.sh                         (deploy script)
 └── .claude/
     ├── settings.json                  → ~/.claude/settings.json
-    │                                    (permissions, hooks, auto-approval, plugins)
+    │                                    (shared settings: auto-approval, etc.)
+    ├── settings.local.json            → ~/.claude/settings.local.json
+    │                                    (machine-specific: auth tokens, permissions)
+    │                                    (gitignored, must be created manually)
     ├── keybindings.json               → ~/.claude/keybindings.json
     ├── hooks/                         → ~/.claude/hooks/
     │   └── (custom hook scripts)
@@ -43,6 +46,25 @@ Options:
 | `--dry-run` | Preview without making changes |
 
 > **Note:** `settings.json` is skipped if it already exists — merge manually.
+
+### Machine-specific settings
+
+Create `~/.claude/settings.local.json` (or symlink from this repo) for machine-specific configuration:
+
+```json
+{
+  "env": {
+    "ANTHROPIC_AUTH_TOKEN": "sk-..."
+  },
+  "permissions": {
+    "allow": ["Bash(gomi:*)"],
+    "deny": ["Bash(rm:*)"]
+  },
+  "model": "haiku"
+}
+```
+
+This file is gitignored to prevent accidentally committing secrets.
 
 ## Hooks
 
